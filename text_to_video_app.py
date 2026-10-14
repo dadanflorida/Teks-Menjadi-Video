@@ -144,19 +144,20 @@ def create_text_image(
 
     return img
 
-def generate_ai_scene_image(scene_text: str, output_path: str, width: int, height: int) -> bool:
-    """Minta gambar adegan ke AI Horde. Layanan publik gratis, tetapi antrean dan batasnya berubah-ubah."""
+def generate_ai_scene_image(scene_text: str, output_path: str, width: int, height: int) -> tuple[bool, str]:
+    """Minta gambar adegan ke AI Horde gratis dan kembalikan alasan jika gagal."""
     prompt = (
-        "Create a cinematic, realistic storytelling scene based on this description: "
+        "Cinematic realistic film still, Indonesian setting, based on this scene: "
         + scene_text
-        + ". Natural lighting, detailed environment, coherent composition, no words, no text, no watermark."
+        + ". Clear subject, natural lighting, detailed environment, coherent composition, "
+          "no words, no text, no watermark."
     )
-    # Anonymous public key for community queue. This is not a private user credential.
     headers = {
         "apikey": "0000000000",
-        "Client-Agent": "TeksMenjadiVideo:1.0:github.com/dadanflorida/Teks-Menjadi-Video",
+        "Client-Agent": "TeksMenjadiVideo:1.1:github.com/dadanflorida/Teks-Menjadi-Video",
         "Content-Type": "application/json",
     }
+    # Tidak mengunci ke satu nama model tertentu; model/worker yang tersedia bisa berubah.
     payload = {
         "prompt": prompt,
         "params": {
@@ -167,8 +168,9 @@ def generate_ai_scene_image(scene_text: str, output_path: str, width: int, heigh
             "height": 512,
             "n": 1,
         },
-        "models": ["AlbedoBase XL (SDXL)"],
         "nsfw": False,
+        "censor_nsfw": True,
+        "r2": True,
     }
     try:
         response = requests.post(
@@ -176,34 +178,44 @@ def generate_ai_scene_image(scene_text: str, output_path: str, width: int, heigh
             headers=headers, json=payload, timeout=30
         )
         if response.status_code not in (200, 202):
-            return False
-        job_id = response.json().get("id")
+            detail = response.text[:250].replace("\n", " ").strip()
+            return False, f"Layanan gambar menolak permintaan (HTTP {response.status_code}). {detail}"
+        try:
+            job_id = response.json().get("id")
+        except Exception:
+            return False, "Jawaban layanan gambar tidak bisa dibaca."
         if not job_id:
-            return False
-        # Limit wait so the app does not hang forever if the public queue is busy.
-        deadline = time.time() + 75
+            detail = response.text[:250].replace("\n", " ").strip()
+            return False, f"Layanan tidak memberikan nomor tugas. {detail}"
+
+        # Beri waktu lebih panjang untuk antrean publik gratis.
+        deadline = time.time() + 150
+        last_state = {}
         while time.time() < deadline:
-            time.sleep(3)
+            time.sleep(4)
             check = requests.get(
                 f"https://aihorde.net/api/v2/generate/check/{job_id}",
                 headers=headers, timeout=20
             )
             if check.status_code != 200:
+                last_state = {"http_status": check.status_code}
                 continue
-            state = check.json()
-            if state.get("faulted"):
-                return False
-            if state.get("done"):
+            last_state = check.json()
+            if last_state.get("faulted"):
+                return False, "Tugas gambar gagal di sisi layanan AI (faulted)."
+            if last_state.get("done"):
                 result = requests.get(
                     f"https://aihorde.net/api/v2/generate/status/{job_id}",
                     headers=headers, timeout=30
                 )
                 if result.status_code != 200:
-                    return False
+                    return False, f"Gambar selesai tetapi hasil tidak bisa diambil (HTTP {result.status_code})."
                 generations = result.json().get("generations", [])
                 if not generations:
-                    return False
+                    return False, "Layanan selesai tetapi tidak mengembalikan gambar."
                 image_value = generations[0].get("img", "")
+                if not image_value:
+                    return False, "Layanan mengembalikan hasil gambar kosong."
                 if image_value.startswith("http://") or image_value.startswith("https://"):
                     img_response = requests.get(image_value, timeout=30)
                     img_response.raise_for_status()
@@ -213,7 +225,6 @@ def generate_ai_scene_image(scene_text: str, output_path: str, width: int, heigh
                 from io import BytesIO
                 with Image.open(BytesIO(image_bytes)) as im:
                     im = im.convert("RGB")
-                    # Fill the target frame without stretching the image.
                     target_ratio = width / height
                     src_ratio = im.width / im.height
                     if src_ratio > target_ratio:
@@ -227,10 +238,16 @@ def generate_ai_scene_image(scene_text: str, output_path: str, width: int, heigh
                     top = (new_h - height) // 2
                     im = im.crop((left, top, left + width, top + height))
                     im.save(output_path, format="JPEG", quality=90)
-                return True
-        return False
-    except Exception:
-        return False
+                return True, "Gambar berhasil dibuat."
+        waiting = last_state.get("waiting", "?")
+        processing = last_state.get("processing", "?")
+        return False, f"Antrean AI belum selesai setelah 150 detik (menunggu: {waiting}, diproses: {processing}). Coba lagi nanti."
+    except requests.Timeout:
+        return False, "Koneksi ke layanan gambar melewati batas waktu."
+    except requests.RequestException as exc:
+        return False, f"Gangguan koneksi ke layanan gambar: {str(exc)[:180]}"
+    except Exception as exc:
+        return False, f"Kesalahan saat mengambil gambar: {str(exc)[:180]}"
 
 def add_caption_to_image(image_path: str, caption: str, output_path: str, width: int, height: int):
     """Tambahkan subtitle yang mudah dibaca di bagian bawah gambar adegan."""
@@ -337,7 +354,7 @@ with col2:
     use_ai_images = st.checkbox(
         "Buat gambar adegan otomatis dengan AI gratis",
         value=True,
-        help="Menggunakan antrean publik AI Horde. Bisa lambat atau gagal saat antrean penuh; jika gagal, aplikasi memakai slide teks sebagai cadangan."
+        help="Menggunakan antrean publik AI Horde tanpa mengunci satu model tertentu. Bisa lambat atau gagal saat antrean penuh; jika gagal, aplikasi menampilkan penyebab dan memakai slide teks sebagai cadangan."
     )
 
     st.markdown("---")
@@ -434,14 +451,19 @@ if generate_btn:
                         used_ai_image = False
                         if use_ai_images:
                             status.text(f"Membuat gambar AI untuk scene {i+1}/{len(sentences)}. Antrean gratis bisa memerlukan waktu...")
-                            used_ai_image = generate_ai_scene_image(sentence, str(img_path), width, height)
+                            used_ai_image, ai_image_message = generate_ai_scene_image(sentence, str(img_path), width, height)
+                        else:
+                            ai_image_message = "Fitur gambar AI tidak diaktifkan."
                         if used_ai_image:
                             caption_path = tmp_path / f"caption_{i}.jpg"
                             add_caption_to_image(str(img_path), sentence, str(caption_path), width, height)
                             img_path = caption_path
                         else:
                             if use_ai_images:
-                                st.warning(f"Gambar AI untuk scene {i+1} tidak tersedia. Scene ini memakai background teks sebagai cadangan.")
+                                st.warning(
+                                    f"Gambar AI untuk scene {i+1} tidak tersedia. "
+                                    f"Penyebab: {ai_image_message} Scene ini memakai background teks sebagai cadangan."
+                                )
                             img = create_text_image(
                                 sentence,
                                 width,
