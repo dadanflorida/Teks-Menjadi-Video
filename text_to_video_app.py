@@ -12,7 +12,7 @@ import tempfile
 import os
 from pathlib import Path
 from moviepy import (
-    AudioFileClip, ImageClip, concatenate_videoclips, CompositeAudioClip
+    AudioFileClip, ImageClip, VideoClip, concatenate_videoclips, CompositeAudioClip
 )
 from moviepy.audio.fx import AudioLoop, MultiplyVolume
 from PIL import Image, ImageDraw, ImageFont
@@ -60,6 +60,70 @@ def split_into_sentences(text: str) -> list[str]:
     # Pola sederhana untuk bahasa Indonesia
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     return [s.strip() for s in sentences if s.strip()]
+
+def parse_script(text: str) -> list[dict[str, str]]:
+    """Pisahkan naskah terstruktur menjadi visual dan teks yang benar-benar dibacakan.
+
+    Format yang didukung:
+    ADEGAN 1 — Judul adegan
+    Deskripsi visual untuk membantu AI membuat gambar.
+    Narasi: Kalimat yang dibacakan narator.
+    Dialog Pendekar: Kalimat yang diucapkan tokoh.
+
+    Jika format adegan/narasi tidak ditemukan, teks biasa diproses per kalimat
+    seperti versi aplikasi sebelumnya.
+    """
+    scene_heading = re.compile(r'^\s*(?:ADEGAN|SCENE)\s*\d+\s*[:—–-]?\s*(.*)$', re.I)
+    speech_label = re.compile(r'^\s*(?:NARASI|DIALOG(?:UE)?(?:\s+[^:]*)?|UCAPAN)\s*:\s*(.*)$', re.I)
+    lines = text.splitlines()
+    has_headings = any(scene_heading.match(line) for line in lines)
+    has_speech_labels = any(speech_label.match(line) for line in lines)
+    if not (has_headings and has_speech_labels):
+        return [{"title": s[:90], "visual": s, "speech": s} for s in split_into_sentences(text) if s.strip()]
+
+    scenes: list[dict[str, str]] = []
+    current = None
+    mode = "visual"
+
+    def finish_scene():
+        nonlocal current
+        if current is None:
+            return
+        current["title"] = current["title"].strip() or "Adegan"
+        current["visual"] = " ".join(x.strip() for x in current["visual_lines"] if x.strip()).strip()
+        current["speech"] = " ".join(x.strip() for x in current["speech_lines"] if x.strip()).strip()
+        # Jika tidak ada kalimat bicara, gunakan judul saja agar scene tetap bisa diproses.
+        if not current["speech"]:
+            current["speech"] = current["title"]
+        if not current["visual"]:
+            current["visual"] = current["title"]
+        scenes.append({"title": current["title"], "visual": current["visual"], "speech": current["speech"]})
+        current = None
+
+    for line in lines:
+        heading = scene_heading.match(line)
+        if heading:
+            finish_scene()
+            title = heading.group(1).strip().strip("—–-: ") or line.strip()
+            current = {"title": title, "visual_lines": [], "speech_lines": []}
+            mode = "visual"
+            continue
+        if current is None:
+            continue
+        label = speech_label.match(line)
+        if label:
+            mode = "speech"
+            if label.group(1).strip():
+                current["speech_lines"].append(label.group(1).strip().strip('"“”'))
+            continue
+        if not line.strip():
+            continue
+        if mode == "speech":
+            current["speech_lines"].append(line.strip().strip('"“”'))
+        else:
+            current["visual_lines"].append(line.strip())
+    finish_scene()
+    return scenes or [{"title": s[:90], "visual": s, "speech": s} for s in split_into_sentences(text) if s.strip()]
 
 def create_background_image(width: int, height: int, color: tuple = (26, 26, 46)) -> Image.Image:
     """Buat background gradient sederhana."""
@@ -249,6 +313,46 @@ def generate_ai_scene_image(scene_text: str, output_path: str, width: int, heigh
     except Exception as exc:
         return False, f"Kesalahan saat mengambil gambar: {str(exc)[:180]}"
 
+def create_motion_clip(image_path: str, duration: float, width: int, height: int):
+    """Buat gerakan kamera perlahan (zoom/pan) dari gambar diam tanpa layanan AI video."""
+    import numpy as np
+
+    with Image.open(image_path) as source:
+        source = source.convert("RGB")
+        # Isi kanvas sesuai rasio video, lalu siapkan ruang kecil untuk gerakan zoom.
+        target_ratio = width / height
+        src_ratio = source.width / source.height
+        if src_ratio > target_ratio:
+            new_h = height
+            new_w = int(height * src_ratio)
+        else:
+            new_w = width
+            new_h = int(width / src_ratio)
+        source = source.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        base = source.crop((left, top, left + width, top + height))
+        max_zoom = 1.08
+        large = base.resize((int(width * max_zoom), int(height * max_zoom)), Image.Resampling.LANCZOS)
+
+    def make_frame(t):
+        progress = min(1.0, max(0.0, t / max(duration, 0.001)))
+        # Zoom lembut dari 1.00x ke 1.08x, disertai geser kecil agar tidak monoton.
+        zoom = 1.0 + 0.08 * progress
+        crop_w = max(width, int(width * max_zoom / zoom))
+        crop_h = max(height, int(height * max_zoom / zoom))
+        travel_x = max(0, large.width - crop_w)
+        travel_y = max(0, large.height - crop_h)
+        # Gerakan horizontal kecil dari kiri ke kanan dan vertikal sangat ringan.
+        x = int(travel_x * progress)
+        y = int(travel_y * (0.25 + 0.5 * progress))
+        x = min(max(0, x), large.width - crop_w)
+        y = min(max(0, y), large.height - crop_h)
+        frame = large.crop((x, y, x + crop_w, y + crop_h)).resize((width, height), Image.Resampling.BILINEAR)
+        return np.asarray(frame)
+
+    return VideoClip(frame_function=make_frame, duration=duration)
+
 def add_caption_to_image(image_path: str, caption: str, output_path: str, width: int, height: int):
     """Tambahkan subtitle yang mudah dibaca di bagian bawah gambar adegan."""
     with Image.open(image_path) as source:
@@ -418,9 +522,9 @@ if generate_btn:
     else:
         with st.spinner("Sedang membuat video... Mohon tunggu sebentar."):
             try:
-                sentences = split_into_sentences(text_input)
-                if not sentences:
-                    sentences = [text_input.strip()]
+                scenes = parse_script(text_input)
+                if not scenes:
+                    scenes = [{"title": text_input.strip()[:90], "visual": text_input.strip(), "speech": text_input.strip()}]
 
                 # Temporary directory
                 with tempfile.TemporaryDirectory() as tmpdir:
@@ -431,14 +535,17 @@ if generate_btn:
                     progress = st.progress(0)
                     status = st.empty()
 
-                    for i, sentence in enumerate(sentences):
-                        status.text(f"Memproses scene {i+1}/{len(sentences)}: {sentence[:50]}...")
-                        progress.progress((i) / len(sentences))
+                    for i, scene in enumerate(scenes):
+                        scene_title = scene["title"]
+                        visual_description = scene["visual"]
+                        speech_text = scene["speech"]
+                        status.text(f"Memproses adegan {i+1}/{len(scenes)}: {scene_title[:50]}...")
+                        progress.progress((i) / len(scenes))
 
-                        # Generate audio per kalimat
+                        # Hanya isi Narasi/Dialog yang dibacakan; judul dan deskripsi visual tidak dibacakan.
                         audio_file = tmp_path / f"audio_{i}.mp3"
                         asyncio.run(
-                            generate_speech(sentence, selected_voice, str(audio_file), rate=speed)
+                            generate_speech(speech_text, selected_voice, str(audio_file), rate=speed)
                         )
                         audio_paths.append(audio_file)
 
@@ -450,22 +557,22 @@ if generate_btn:
                         img_path = tmp_path / f"img_{i}.jpg"
                         used_ai_image = False
                         if use_ai_images:
-                            status.text(f"Membuat gambar AI untuk scene {i+1}/{len(sentences)}. Antrean gratis bisa memerlukan waktu...")
-                            used_ai_image, ai_image_message = generate_ai_scene_image(sentence, str(img_path), width, height)
+                            status.text(f"Membuat gambar AI untuk adegan {i+1}/{len(scenes)}. Antrean gratis bisa memerlukan waktu...")
+                            used_ai_image, ai_image_message = generate_ai_scene_image(visual_description, str(img_path), width, height)
                         else:
                             ai_image_message = "Fitur gambar AI tidak diaktifkan."
                         if used_ai_image:
                             caption_path = tmp_path / f"caption_{i}.jpg"
-                            add_caption_to_image(str(img_path), sentence, str(caption_path), width, height)
+                            add_caption_to_image(str(img_path), scene_title, str(caption_path), width, height)
                             img_path = caption_path
                         else:
                             if use_ai_images:
                                 st.warning(
-                                    f"Gambar AI untuk scene {i+1} tidak tersedia. "
+                                    f"Gambar AI untuk adegan {i+1} tidak tersedia. "
                                     f"Penyebab: {ai_image_message} Scene ini memakai background teks sebagai cadangan."
                                 )
                             img = create_text_image(
-                                sentence,
+                                scene_title,
                                 width,
                                 height,
                                 bg_color=bg_color,
@@ -474,8 +581,8 @@ if generate_btn:
                             img_path = tmp_path / f"img_{i}.png"
                             img.save(img_path)
 
-                        # Buat clip
-                        img_clip = ImageClip(str(img_path)).with_duration(duration)
+                        # Buat clip dengan gerakan kamera halus dari gambar diam (tanpa AI video).
+                        img_clip = create_motion_clip(str(img_path), duration, width, height)
                         audio_clip = AudioFileClip(str(audio_file))
                         video_clip = img_clip.with_audio(audio_clip)
                         clips.append(video_clip)
@@ -554,7 +661,7 @@ if generate_btn:
                     # Info
                     music_info = " • Musik latar aktif" if (enable_music and music_file is not None) else ""
                     st.info(
-                        f"**Detail:** {len(sentences)} scene • "
+                        f"**Detail:** {len(scenes)} adegan • "
                         f"{width}x{height} • "
                         f"Durasi ±{final_clip.duration:.1f} detik • "
                         f"Suara: {voice_option}{music_info}"
@@ -580,7 +687,7 @@ st.markdown(
     """
     <div style="text-align: center; color: #888; font-size: 0.9rem;">
         Dibuat dengan ❤️ • Edge-TTS + MoviePy + AI Horde (gambar adegan opsional)<br>
-        Gambar AI menggunakan antrean publik gratis; ketersediaan dan waktu tunggu dapat berubah.
+        Gambar AI menggunakan antrean publik gratis; setiap gambar diberi gerakan kamera zoom/pan sederhana.
     </div>
     """,
     unsafe_allow_html=True
