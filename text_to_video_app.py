@@ -17,6 +17,9 @@ from moviepy import (
 from moviepy.audio.fx import AudioLoop, MultiplyVolume
 from PIL import Image, ImageDraw, ImageFont
 import re
+import requests
+import base64
+import time
 
 st.set_page_config(
     page_title="Text ke Video Natural | Bahasa Indonesia",
@@ -141,6 +144,133 @@ def create_text_image(
 
     return img
 
+def generate_ai_scene_image(scene_text: str, output_path: str, width: int, height: int) -> bool:
+    """Minta gambar adegan ke AI Horde. Layanan publik gratis, tetapi antrean dan batasnya berubah-ubah."""
+    prompt = (
+        "Create a cinematic, realistic storytelling scene based on this description: "
+        + scene_text
+        + ". Natural lighting, detailed environment, coherent composition, no words, no text, no watermark."
+    )
+    # Anonymous public key for community queue. This is not a private user credential.
+    headers = {
+        "apikey": "0000000000",
+        "Client-Agent": "TeksMenjadiVideo:1.0:github.com/dadanflorida/Teks-Menjadi-Video",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "prompt": prompt,
+        "params": {
+            "sampler_name": "k_euler",
+            "cfg_scale": 7,
+            "steps": 20,
+            "width": 512,
+            "height": 512,
+            "n": 1,
+        },
+        "models": ["AlbedoBase XL (SDXL)"],
+        "nsfw": False,
+    }
+    try:
+        response = requests.post(
+            "https://aihorde.net/api/v2/generate/async",
+            headers=headers, json=payload, timeout=30
+        )
+        if response.status_code not in (200, 202):
+            return False
+        job_id = response.json().get("id")
+        if not job_id:
+            return False
+        # Limit wait so the app does not hang forever if the public queue is busy.
+        deadline = time.time() + 75
+        while time.time() < deadline:
+            time.sleep(3)
+            check = requests.get(
+                f"https://aihorde.net/api/v2/generate/check/{job_id}",
+                headers=headers, timeout=20
+            )
+            if check.status_code != 200:
+                continue
+            state = check.json()
+            if state.get("faulted"):
+                return False
+            if state.get("done"):
+                result = requests.get(
+                    f"https://aihorde.net/api/v2/generate/status/{job_id}",
+                    headers=headers, timeout=30
+                )
+                if result.status_code != 200:
+                    return False
+                generations = result.json().get("generations", [])
+                if not generations:
+                    return False
+                image_value = generations[0].get("img", "")
+                if image_value.startswith("http://") or image_value.startswith("https://"):
+                    img_response = requests.get(image_value, timeout=30)
+                    img_response.raise_for_status()
+                    image_bytes = img_response.content
+                else:
+                    image_bytes = base64.b64decode(image_value)
+                from io import BytesIO
+                with Image.open(BytesIO(image_bytes)) as im:
+                    im = im.convert("RGB")
+                    # Fill the target frame without stretching the image.
+                    target_ratio = width / height
+                    src_ratio = im.width / im.height
+                    if src_ratio > target_ratio:
+                        new_h = height
+                        new_w = int(height * src_ratio)
+                    else:
+                        new_w = width
+                        new_h = int(width / src_ratio)
+                    im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    left = (new_w - width) // 2
+                    top = (new_h - height) // 2
+                    im = im.crop((left, top, left + width, top + height))
+                    im.save(output_path, format="JPEG", quality=90)
+                return True
+        return False
+    except Exception:
+        return False
+
+def add_caption_to_image(image_path: str, caption: str, output_path: str, width: int, height: int):
+    """Tambahkan subtitle yang mudah dibaca di bagian bawah gambar adegan."""
+    with Image.open(image_path) as source:
+        img = source.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font_size = max(24, min(42, width // 24))
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    font = None
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except Exception:
+                pass
+    if font is None:
+        font = ImageFont.load_default()
+    lines = wrap_text(caption, font, int(width * 0.86))
+    line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] for line in lines]
+    total_h = sum(line_heights) + max(0, len(lines)-1) * 8
+    pad = max(18, width // 40)
+    box_h = total_h + pad * 2
+    box_top = height - box_h - max(20, height // 30)
+    draw.rounded_rectangle((int(width*0.05), box_top, int(width*0.95), height-max(12, height//60)), radius=18, fill=(0,0,0,175))
+    y = box_top + pad
+    for i, line in enumerate(lines):
+        bbox = draw.textbbox((0,0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        x = (width - tw) // 2
+        draw.text((x+2, y+2), line, font=font, fill=(0,0,0,255))
+        draw.text((x, y), line, font=font, fill=(255,255,255,255))
+        y += line_heights[i] + 8
+    Image.alpha_composite(img, overlay).convert("RGB").save(output_path, quality=92)
+
 async def generate_speech(text: str, voice: str, output_path: str, rate: str = "+0%"):
     """Generate audio dengan edge-tts."""
     communicate = edge_tts.Communicate(text, voice, rate=rate)
@@ -202,6 +332,12 @@ with col2:
         "Gaya Background",
         options=["Gelap (Default)", "Biru Laut", "Hijau Hutan", "Ungu Soft", "Abu Profesional"],
         index=0
+    )
+
+    use_ai_images = st.checkbox(
+        "Buat gambar adegan otomatis dengan AI gratis",
+        value=True,
+        help="Menggunakan antrean publik AI Horde. Bisa lambat atau gagal saat antrean penuh; jika gagal, aplikasi memakai slide teks sebagai cadangan."
     )
 
     st.markdown("---")
@@ -293,16 +429,28 @@ if generate_btn:
                         # Minimal 2 detik, maksimal sesuai audio + sedikit padding
                         duration = max(duration + 0.3, 2.0)
 
-                        # Buat gambar teks
-                        img = create_text_image(
-                            sentence,
-                            width,
-                            height,
-                            bg_color=bg_color,
-                            font_size=48 if width >= 1080 else 36
-                        )
-                        img_path = tmp_path / f"img_{i}.png"
-                        img.save(img_path)
+                        # Buat gambar adegan AI jika diaktifkan; jika gagal, gunakan slide teks.
+                        img_path = tmp_path / f"img_{i}.jpg"
+                        used_ai_image = False
+                        if use_ai_images:
+                            status.text(f"Membuat gambar AI untuk scene {i+1}/{len(sentences)}. Antrean gratis bisa memerlukan waktu...")
+                            used_ai_image = generate_ai_scene_image(sentence, str(img_path), width, height)
+                        if used_ai_image:
+                            caption_path = tmp_path / f"caption_{i}.jpg"
+                            add_caption_to_image(str(img_path), sentence, str(caption_path), width, height)
+                            img_path = caption_path
+                        else:
+                            if use_ai_images:
+                                st.warning(f"Gambar AI untuk scene {i+1} tidak tersedia. Scene ini memakai background teks sebagai cadangan.")
+                            img = create_text_image(
+                                sentence,
+                                width,
+                                height,
+                                bg_color=bg_color,
+                                font_size=48 if width >= 1080 else 36
+                            )
+                            img_path = tmp_path / f"img_{i}.png"
+                            img.save(img_path)
 
                         # Buat clip
                         img_clip = ImageClip(str(img_path)).with_duration(duration)
@@ -409,8 +557,8 @@ st.markdown("---")
 st.markdown(
     """
     <div style="text-align: center; color: #888; font-size: 0.9rem;">
-        Dibuat dengan ❤️ • Edge-TTS (Microsoft Neural Voices) + MoviePy<br>
-        Mendukung Bahasa Indonesia, Jawa, dan Sunda
+        Dibuat dengan ❤️ • Edge-TTS + MoviePy + AI Horde (gambar adegan opsional)<br>
+        Gambar AI menggunakan antrean publik gratis; ketersediaan dan waktu tunggu dapat berubah.
     </div>
     """,
     unsafe_allow_html=True
